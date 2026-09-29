@@ -61,6 +61,65 @@ function hashPasswordNode(plainText: string, salt: string = "ISM_SAFETY_SALT_202
   return `$ism_sha256$${hex}`;
 }
 
+// Criptografia simétrica AES-256-GCM para CPF (Node.js — espelha a implementação do browser)
+const CPF_ENC_PREFIX_NODE = "$ism_cpf_enc$";
+const CPF_AES_KEY_MATERIAL_NODE = "ISM_CPF_AES256_KEY_2026_LGPD_#";
+
+function deriveAESKeyNode(): Buffer {
+  return crypto.pbkdf2Sync(
+    CPF_AES_KEY_MATERIAL_NODE,
+    "ISM_SAFETY_SALT_2026_SECURE_#",
+    100000,
+    32,
+    "sha256"
+  );
+}
+
+function encryptCPFNode(plainCpf: string): string {
+  if (!plainCpf || plainCpf.trim() === "") return "";
+  if (plainCpf.startsWith(CPF_ENC_PREFIX_NODE)) return plainCpf;
+  try {
+    const key = deriveAESKeyNode();
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+    let encrypted = cipher.update(plainCpf, "utf8", "hex");
+    encrypted += cipher.final("hex");
+    const authTag = cipher.getAuthTag().toString("hex");
+    return `${CPF_ENC_PREFIX_NODE}${iv.toString("hex")}:${encrypted}${authTag}`;
+  } catch (err) {
+    console.warn("[Security Server] Falha na criptografia AES-GCM do CPF:", err);
+    return plainCpf;
+  }
+}
+
+function decryptCPFNode(encryptedCpf: string): string {
+  if (!encryptedCpf || !encryptedCpf.startsWith(CPF_ENC_PREFIX_NODE)) return encryptedCpf;
+  try {
+    const payload = encryptedCpf.slice(CPF_ENC_PREFIX_NODE.length);
+    const [ivHex, cipherAndTagHex] = payload.split(":");
+    if (!ivHex || !cipherAndTagHex || cipherAndTagHex.length < 32) return encryptedCpf;
+    const iv = Buffer.from(ivHex, "hex");
+    const cipherHex = cipherAndTagHex.slice(0, -32);
+    const authTagHex = cipherAndTagHex.slice(-32);
+    const key = deriveAESKeyNode();
+    const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+    decipher.setAuthTag(Buffer.from(authTagHex, "hex"));
+    let decrypted = decipher.update(cipherHex, "hex", "utf8");
+    decrypted += decipher.final("utf8");
+    return decrypted;
+  } catch (err) {
+    console.warn("[Security Server] Falha na descriptografia AES-GCM do CPF:", err);
+    return encryptedCpf;
+  }
+}
+
+function isValidEmailServer(email: string): boolean {
+  if (!email || typeof email !== "string") return false;
+  const trimmed = email.trim();
+  if (trimmed.length < 5 || trimmed.length > 254) return false;
+  return /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(trimmed);
+}
+
 function buildOtpEmailHtml(userName: string, otpCode: string): string {
   return `<!DOCTYPE html>
 <html>
@@ -330,9 +389,11 @@ async function startServer() {
 
   app.post("/api/login", rateLimit(15, 60000), (req, res) => {
     const { username, password } = req.body;
-    const user = users.find(u => u.username === username && u.password === password);
+    const hashed = hashPasswordNode(password || "");
+    const user = users.find(u => u.username === username && (u.password === password || u.password === hashed));
     if (user) {
       const { password: _, ...safeUser } = user;
+      safeUser.cpf = decryptCPFNode(safeUser.cpf || "");
       res.json({ success: true, user: safeUser });
     } else {
       res.status(401).json({ success: false, message: "Usuário ou senha incorretos." });
@@ -341,23 +402,105 @@ async function startServer() {
 
   app.post("/api/user/update", (req, res) => {
     const updated = req.body;
+    if (updated.email && !isValidEmailServer(updated.email)) {
+      return res.status(400).json({ success: false, message: "Formato de e-mail inválido." });
+    }
     const userIndex = users.findIndex(u => u.username === updated.username);
     if (userIndex !== -1) {
+      if (updated.cpf) {
+        updated.cpf = encryptCPFNode(updated.cpf);
+      }
+      if (updated.password && !updated.password.startsWith("$ism_sha256$")) {
+        updated.password = hashPasswordNode(updated.password);
+      }
       users[userIndex] = { ...users[userIndex], ...updated };
       const { password: _, ...safeUser } = users[userIndex];
+      safeUser.cpf = decryptCPFNode(safeUser.cpf || "");
       res.json({ success: true, user: safeUser });
     } else {
       res.status(404).json({ success: false, message: "Usuário não encontrado." });
     }
   });
 
-  app.post("/api/register", (req, res) => {
-    const userData: UserData = req.body;
-    if (users.find(u => u.username === userData.username)) {
-      return res.status(400).json({ success: false, message: "Nome de usuário já existe." });
+  app.post("/api/register", async (req, res) => {
+    try {
+      const userData: UserData = req.body;
+
+      if (!userData.username || userData.username.trim().length < 3) {
+        return res.status(400).json({ success: false, message: "Nome de usuário deve conter ao menos 3 caracteres." });
+      }
+
+      if (!userData.email || !isValidEmailServer(userData.email)) {
+        return res.status(400).json({ success: false, message: "O endereço de e-mail informado possui formato inválido." });
+      }
+
+      const normalizedEmail = userData.email.trim().toLowerCase();
+
+      // Checagem em memória
+      if (users.find(u => u.username === userData.username)) {
+        return res.status(400).json({ success: false, message: "Nome de usuário já existe no sistema." });
+      }
+      if (users.find(u => u.email?.trim().toLowerCase() === normalizedEmail)) {
+        return res.status(400).json({ success: false, message: "Este e-mail já possui cadastro no sistema. Utilize outro e-mail ou recupere sua senha." });
+      }
+
+      // Checagem no Supabase se ativo
+      if (supabase) {
+        const { data: dbExisting, error } = await supabase
+          .from("users")
+          .select("id, username, email")
+          .or(`username.eq.${userData.username},email.ilike.${normalizedEmail}`);
+
+        if (!error && dbExisting && dbExisting.length > 0) {
+          const match = dbExisting[0];
+          if (match.username === userData.username) {
+            return res.status(400).json({ success: false, message: "Nome de usuário já existe no sistema." });
+          }
+          return res.status(400).json({ success: false, message: "Este e-mail já possui cadastro no sistema. Utilize outro e-mail ou recupere sua senha." });
+        }
+      }
+
+      // Hash da senha e Criptografia AES-256 do CPF
+      const securePassword = hashPasswordNode(userData.password || "123456");
+      const secureCpf = encryptCPFNode(userData.cpf || "");
+
+      const newUser: UserData = {
+        ...userData,
+        password: securePassword,
+        cpf: secureCpf,
+        email: normalizedEmail
+      };
+
+      users.push(newUser);
+
+      // Persistir no Supabase se conectado
+      if (supabase) {
+        try {
+          await supabase.from("users").insert({
+            id: `USR-${Date.now()}`,
+            username: newUser.username,
+            password: newUser.password,
+            role: "VIEWER",
+            first_name: newUser.firstName,
+            last_name: newUser.lastName,
+            cpf: newUser.cpf || null,
+            position: newUser.position || null,
+            department: newUser.department || null,
+            email: newUser.email || null,
+            phone: newUser.phone || null,
+            active: true,
+            company_id: "COMP-001"
+          });
+        } catch (dbErr) {
+          console.warn("[Register Server] Falha ao persistir no Supabase:", dbErr);
+        }
+      }
+
+      res.json({ success: true, message: "Usuário cadastrado com sucesso." });
+    } catch (err: any) {
+      console.error("[Register Server] Erro:", err);
+      res.status(500).json({ success: false, message: "Erro interno ao cadastrar usuário." });
     }
-    users.push(userData);
-    res.json({ success: true, message: "Usuário cadastrado com sucesso." });
   });
 
   // ------------------------------------------------------------
@@ -509,13 +652,17 @@ async function startServer() {
           printDevOtpBanner(normalizedEmail, userName, otpCode);
         }
       } else {
-        // OWASP: Anti-enumeração de contas (mensagem idêntica)
-        console.log(`[Forgot-Password] Solicitação ignorada para e-mail inexistente: ${normalizedEmail}`);
+        // E-mail não encontrado em nenhum banco — retorna erro explícito
+        console.log(`[Forgot-Password] Solicitação rejeitada para e-mail inexistente: ${normalizedEmail}`);
+        return res.status(404).json({
+          success: false,
+          message: "O e-mail informado não possui cadastro no sistema. Verifique o endereço ou entre em contato com o administrador."
+        });
       }
 
       return res.json({
         success: true,
-        message: "Se o e-mail informado estiver cadastrado no sistema, um código de uso único (OTP) foi enviado."
+        message: "Código de verificação enviado com sucesso para o e-mail cadastrado."
       });
     } catch (err) {
       console.error("[Forgot-Password] Erro interno:", err);
@@ -926,8 +1073,9 @@ async function startServer() {
       const telemetryData: EmployeeTelemetry = {
         aceleracao: parseFloat(dados.aceleracao) || 0,
         aceleracaoG: parseFloat(dados.aceleracaoG) || 0,
-        picoAceleracaoG: parseFloat(dados.picoAceleracaoG) || 0,
+        picoAceleracaoG: parseFloat(dados.picoAceleracaoG) || parseFloat(dados.picoG) || 0,
         picoG: parseFloat(dados.picoG) || 0,
+        giroscopioGraus: parseFloat(dados.giroscopioGraus) || 0,
         pontuacao: Number(dados.pontuacao) || 0,
         pontosMPU: Number(dados.pontosMPU) || 0,
         pontosVibracao: Number(dados.pontosVibracao) || 0,
@@ -989,6 +1137,10 @@ async function startServer() {
       });
     }
     res.json(latestESP32Data);
+  });
+
+  app.get("/api/employees", (_req, res) => {
+    res.json(employees);
   });
 
   app.get("/api/status", (_req, res) => {

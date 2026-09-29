@@ -529,7 +529,15 @@ export default function Dashboard({
                   {telemetry?.aceleracaoG !== undefined ? telemetry.aceleracaoG.toFixed(2) : "1.00"} <span className="text-sm font-bold text-yellow-500 font-sans">G</span>
                 </div>
                 <p className="text-[11px] text-zinc-500 mt-2">
-                  Pico Máximo Registrado: <strong className="text-zinc-300">{telemetry?.picoG !== undefined ? telemetry.picoG.toFixed(2) : "1.01"} G</strong>
+                  Pico Máximo Registrado: <strong className="text-zinc-300">
+                    {telemetry?.picoAceleracaoG !== undefined && telemetry.picoAceleracaoG > 0
+                      ? telemetry.picoAceleracaoG.toFixed(2)
+                      : (telemetry?.picoG !== undefined && telemetry.picoG > 0
+                          ? telemetry.picoG.toFixed(2)
+                          : (telemetry?.aceleracaoG !== undefined && telemetry.aceleracaoG > 0 
+                              ? telemetry.aceleracaoG.toFixed(2) 
+                              : "1.00"))} G
+                  </strong>
                 </p>
               </div>
 

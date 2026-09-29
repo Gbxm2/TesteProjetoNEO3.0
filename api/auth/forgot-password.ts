@@ -143,7 +143,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    if (userFound && supabase) {
+    if (!userFound) {
+      console.log(`[forgot-password] E-mail não cadastrado rejeitado: ${normalizedEmail}`);
+      return res.status(404).json({
+        success: false,
+        message: "O e-mail digitado não possui cadastro no sistema."
+      });
+    }
+
+    if (supabase) {
       // Gerar OTP de 6 dígitos
       const otpCode = Math.floor(100000 + crypto.randomInt(900000)).toString();
       const codeHash = hashOtp(otpCode, normalizedEmail);
@@ -216,14 +224,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.json({
         success: true,
         demoOtp: otpCode,
-        message: "Se o e-mail informado estiver cadastrado, um código de uso único (OTP) foi enviado."
+        message: "Código de verificação enviado com sucesso para o e-mail cadastrado."
       });
     }
 
-    // OWASP: Resposta neutra para usuário não encontrado
-    return res.json({
-      success: true,
-      message: "Se o e-mail informado estiver cadastrado, um código de uso único (OTP) foi enviado."
+    return res.status(500).json({
+      success: false,
+      message: "Falha de comunicação com o banco de dados."
     });
   } catch (err: any) {
     console.error("[forgot-password] Erro interno:", err);

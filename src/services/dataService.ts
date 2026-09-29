@@ -15,7 +15,11 @@ import {
   createAuditLog, 
   SecurityAuditRecord,
   maskCPF,
-  sanitizeInput 
+  sanitizeInput,
+  encryptCPF,
+  decryptCPF,
+  isCPFEncrypted,
+  isValidEmailStrict
 } from "../utils/security";
 
 // Tipos para comunicação bidirecional de eventos Supabase Realtime
@@ -636,13 +640,14 @@ async function runBidirectionalHeartbeatSync() {
     if (!uErr && dbUsers) {
       const currentLocalUsers = getFromStorage<UserRecord[]>("ism_users", SEED_USERS);
       let usersChanged = false;
-      const mapped: UserRecord[] = dbUsers.map(u => ({
+      // Descriptografa CPF de cada usuário sincronizado (AES-GCM)
+      const mapped: UserRecord[] = await Promise.all(dbUsers.map(async u => ({
         id: u.id,
         firstName: u.first_name || "",
         lastName: u.last_name || "",
         username: u.username,
         role: (u.role as UserRole) || "VIEWER",
-        cpf: u.cpf || "",
+        cpf: await decryptCPF(u.cpf || ""),
         position: u.position || "",
         department: u.department || "",
         email: u.email || "",
@@ -650,7 +655,7 @@ async function runBidirectionalHeartbeatSync() {
         active: u.active ?? true,
         companyId: u.company_id,
         createdAt: u.created_at
-      }));
+      })));
 
       for (const m of mapped) {
         const found = currentLocalUsers.find(x => x.username === m.username || (x.id && x.id === m.id));
@@ -817,14 +822,15 @@ export const dataService = {
       try {
         const { data, error } = await supabase.from("users").select("*").order("created_at", { ascending: true });
         if (!error && data && data.length > 0) {
-          const mappedUsers: UserRecord[] = data.map(u => ({
+          // Descriptografa CPF de cada usuário em paralelo (AES-GCM)
+          const mappedUsers: UserRecord[] = await Promise.all(data.map(async u => ({
             id: u.id,
             firstName: u.first_name,
             lastName: u.last_name,
             username: u.username,
             role: u.role as UserRole,
             password: u.password,
-            cpf: u.cpf || "",
+            cpf: await decryptCPF(u.cpf || ""),
             position: u.position || "",
             department: u.department || "",
             email: u.email || "",
@@ -832,7 +838,7 @@ export const dataService = {
             active: u.active ?? true,
             companyId: u.company_id,
             createdAt: u.created_at
-          }));
+          })));
           saveToStorage("ism_users", mappedUsers);
           return mappedUsers;
         }
@@ -840,7 +846,11 @@ export const dataService = {
         console.warn("[dataService] Falha ao buscar usuários do Supabase, utilizando cache local:", err);
       }
     }
-    return getFromStorage<UserRecord[]>("ism_users", SEED_USERS);
+    const localUsers = getFromStorage<UserRecord[]>("ism_users", SEED_USERS);
+    return Promise.all(localUsers.map(async u => ({
+      ...u,
+      cpf: await decryptCPF(u.cpf || "")
+    })));
   },
 
   // Ouvinte de eventos em tempo real para reatividade no React
@@ -923,7 +933,7 @@ export const dataService = {
               lastName: data.last_name,
               username: data.username,
               role: data.role as UserRole,
-              cpf: data.cpf,
+              cpf: await decryptCPF(data.cpf || ""),
               position: data.position,
               department: data.department,
               email: data.email,
@@ -962,7 +972,7 @@ export const dataService = {
             lastName: found.lastName,
             username: found.username,
             role: found.role,
-            cpf: found.cpf,
+            cpf: found.cpf ? await decryptCPF(found.cpf) : "",
             position: found.position,
             department: found.department,
             email: found.email,
@@ -987,6 +997,22 @@ export const dataService = {
       securePassword = await hashPassword(securePassword);
     }
 
+    // Criptografia AES-GCM do CPF antes de persistir (LGPD — proteção de dados pessoais sensíveis)
+    let secureCpf = user.cpf;
+    if (secureCpf && secureCpf.trim() !== "" && !isCPFEncrypted(secureCpf)) {
+      secureCpf = await encryptCPF(secureCpf);
+      console.log("[Security] CPF criptografado com AES-256-GCM antes do armazenamento");
+    }
+
+    // Validação rigorosa de e-mail no fluxo de cadastro público ou edição
+    if (user.email && user.email.trim() !== "") {
+      if (!isValidEmailStrict(user.email)) {
+        return { success: false, message: "O endereço de e-mail informado possui formato inválido." };
+      }
+    } else if (actor === "register") {
+      return { success: false, message: "O endereço de e-mail é obrigatório para realizar o cadastro." };
+    }
+
     const existingIndex = localUsers.findIndex(u => (user.id && u.id === user.id) || u.username === user.username);
     let savedRecord: UserRecord;
 
@@ -995,11 +1021,28 @@ export const dataService = {
       return { success: false, message: "Este nome de usuário já está em uso localmente. Por favor, escolha outro." };
     }
 
+    // Validação de duplicidade de e-mail no armazenamento local
+    if (user.email && user.email.trim() !== "") {
+      const normalizedNewEmail = user.email.trim().toLowerCase();
+      const duplicateEmailUser = localUsers.find(
+        u => u.email && u.email.trim().toLowerCase() === normalizedNewEmail &&
+             (user.username ? u.username !== user.username : true) &&
+             (user.id ? u.id !== user.id : true)
+      );
+      if (duplicateEmailUser && (actor === "register" || existingIndex < 0)) {
+        return {
+          success: false,
+          message: "Este endereço de e-mail já está cadastrado no sistema. Utilize outro e-mail ou a recuperação de senha."
+        };
+      }
+    }
+
     if (existingIndex >= 0) {
       savedRecord = { 
         ...localUsers[existingIndex], 
         ...user,
-        password: securePassword || localUsers[existingIndex].password
+        password: securePassword || localUsers[existingIndex].password,
+        cpf: secureCpf || localUsers[existingIndex].cpf
       } as UserRecord;
       updatedUsers = [...localUsers];
       updatedUsers[existingIndex] = savedRecord;
@@ -1012,7 +1055,7 @@ export const dataService = {
         username: user.username || `user_${Date.now()}`,
         role: user.role || "VIEWER",
         password: securePassword || (await hashPassword("123456")),
-        cpf: user.cpf || "",
+        cpf: secureCpf || "",
         position: user.position || "",
         department: user.department || "",
         email: user.email || "",
@@ -1046,12 +1089,29 @@ export const dataService = {
           return { success: false, message: "Este nome de usuário já está em uso no Supabase. Por favor, escolha outro." };
         }
 
+        // Verificar duplicidade de e-mail no Supabase para novos cadastros
+        if (user.email && user.email.trim() !== "" && (actor === "register" || !dbExisting)) {
+          const normalizedNewEmail = user.email.trim().toLowerCase();
+          const { data: dbEmailMatch } = await supabase
+            .from("users")
+            .select("id, username, email")
+            .ilike("email", normalizedNewEmail)
+            .limit(1);
+
+          if (dbEmailMatch && dbEmailMatch.length > 0 && dbEmailMatch[0].username !== usernameToMatch) {
+            return {
+              success: false,
+              message: "Este endereço de e-mail já está cadastrado no sistema. Utilize outro e-mail ou a recuperação de senha."
+            };
+          }
+        }
+
         if (dbExisting) {
           // Atualização de usuário existente: enviamos apenas campos alterados/válidos
           const updatePayload: any = {
             first_name: user.firstName !== undefined ? user.firstName : savedRecord.firstName,
             last_name: user.lastName !== undefined ? user.lastName : savedRecord.lastName,
-            cpf: user.cpf !== undefined ? user.cpf : savedRecord.cpf,
+            cpf: secureCpf !== undefined ? secureCpf : savedRecord.cpf,
             position: user.position !== undefined ? user.position : savedRecord.position,
             department: user.department !== undefined ? user.department : savedRecord.department,
             email: user.email !== undefined ? user.email : savedRecord.email,
@@ -1083,7 +1143,7 @@ export const dataService = {
             role: savedRecord.role,
             first_name: savedRecord.firstName,
             last_name: savedRecord.lastName,
-            cpf: savedRecord.cpf || null,
+            cpf: secureCpf || savedRecord.cpf || null,
             position: savedRecord.position || null,
             department: savedRecord.department || null,
             email: savedRecord.email || null,
@@ -1336,10 +1396,10 @@ export const dataService = {
       try {
         const { data, error } = await supabase.from("employees").select("*").order("id", { ascending: true });
         if (!error && data && data.length > 0) {
-          const mappedEmployees: Employee[] = data.map(e => ({
+          const mappedEmployees: Employee[] = await Promise.all(data.map(async e => ({
             id: e.id,
             name: e.name,
-            cpf: e.cpf,
+            cpf: await decryptCPF(e.cpf || ""),
             matricula: e.matricula,
             roleFunction: e.role_function,
             department: e.department,
@@ -1351,7 +1411,7 @@ export const dataService = {
             lastSeen: Number(e.last_seen) || 0,
             battery: typeof e.battery === "number" ? e.battery : 100,
             assignedHelmetId: e.assigned_helmet_id
-          }));
+          })));
           saveToStorage("ism_employees", mappedEmployees);
           return mappedEmployees;
         }
@@ -1359,7 +1419,11 @@ export const dataService = {
         console.warn("[dataService] Erro ao carregar funcionários do Supabase:", e);
       }
     }
-    return getFromStorage<Employee[]>("ism_employees", SEED_EMPLOYEES);
+    const localEmployees = getFromStorage<Employee[]>("ism_employees", SEED_EMPLOYEES);
+    return Promise.all(localEmployees.map(async e => ({
+      ...e,
+      cpf: await decryptCPF(e.cpf || "")
+    })));
   },
 
   async saveEmployee(employee: Employee): Promise<MutationResult<Employee>> {
@@ -1369,8 +1433,14 @@ export const dataService = {
       ? employee.assignedHelmetId.trim() 
       : null;
 
+    let secureCpf = employee.cpf;
+    if (secureCpf && secureCpf.trim() !== "" && !isCPFEncrypted(secureCpf)) {
+      secureCpf = await encryptCPF(secureCpf);
+    }
+
     const cleanedEmployee: Employee = {
       ...employee,
+      cpf: secureCpf || "",
       assignedHelmetId: sanitizedHelmetId
     };
 
@@ -1388,7 +1458,7 @@ export const dataService = {
         const payload = {
           id: cleanedEmployee.id,
           name: cleanedEmployee.name,
-          cpf: cleanedEmployee.cpf || null,
+          cpf: secureCpf || null,
           matricula: cleanedEmployee.matricula || null,
           role_function: cleanedEmployee.roleFunction || null,
           department: cleanedEmployee.department || null,
@@ -1653,6 +1723,11 @@ export const dataService = {
 
     // 2. Contingência autônoma: Supabase Cloud ou Local Storage (garante funcionamento no Vercel e na banca)
     try {
+      // Validação rigorosa do formato de e-mail
+      if (!isValidEmailStrict(normalizedEmail)) {
+        return { success: false, message: "O endereço de e-mail informado possui formato inválido." };
+      }
+
       let userFound = false;
       let userName = "Operador";
 
@@ -1681,56 +1756,61 @@ export const dataService = {
         }
       }
 
-      if (userFound) {
-        // Gerar código numérico de 6 dígitos
-        const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
-        const hashedCode = await hashPassword(otpCode);
-        const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-
-        if (isSupabaseConfigured() && supabase) {
-          try {
-            await supabase.from("password_resets").update({ used: true }).eq("email", normalizedEmail).eq("used", false);
-            await supabase.from("password_resets").insert({
-              email: normalizedEmail,
-              code_hash: hashedCode,
-              attempts: 0,
-              expires_at: expiresAt,
-              used: false
-            });
-          } catch (e) {
-            console.warn("[dataService] Gravação no Supabase password_resets:", e);
-          }
-        }
-
-        // Armazenar localmente para contingência em modo apresentação
-        const resets = getFromStorage<any[]>("ism_password_resets", []);
-        resets.forEach(r => { if (r.email === normalizedEmail) r.used = true; });
-        resets.push({
-          email: normalizedEmail,
-          code: otpCode,
-          code_hash: hashedCode,
-          expires_at: Date.now() + 10 * 60 * 1000,
-          used: false
-        });
-        saveToStorage("ism_password_resets", resets);
-
-        const log = createAuditLog("PASSWORD_RESET_REQUEST", normalizedEmail, undefined, "Solicitação de código OTP gerada");
-        const logs = getFromStorage<SecurityAuditRecord[]>("ism_audit_logs", []);
-        logs.unshift(log);
-        saveToStorage("ism_audit_logs", logs.slice(0, 100));
-
-        // Feedback no console do navegador para demonstração rápida caso e-mail real não esteja configurado
-        console.info(
-          `%c[INDUSTRIAL SAFETY MONITOR - DEMO OTP]%c\nE-mail: ${normalizedEmail}\nCódigo de Verificação: ${otpCode}\nValidade: 10 minutos`,
-          "background: #eab308; color: #000; font-weight: bold; padding: 2px 6px; border-radius: 4px;",
-          "color: #eab308; font-weight: bold;"
-        );
+      // Verificação explícita: informar caso o e-mail não possua cadastro
+      if (!userFound) {
+        return { 
+          success: false, 
+          message: "O e-mail informado não possui cadastro no sistema. Verifique o endereço ou entre em contato com o administrador." 
+        };
       }
 
-      // OWASP: Resposta neutra para prevenção de enumeração de contas
+      // Gerar código numérico de 6 dígitos
+      const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+      const hashedCode = await hashPassword(otpCode);
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+      if (isSupabaseConfigured() && supabase) {
+        try {
+          await supabase.from("password_resets").update({ used: true }).eq("email", normalizedEmail).eq("used", false);
+          await supabase.from("password_resets").insert({
+            email: normalizedEmail,
+            code_hash: hashedCode,
+            attempts: 0,
+            expires_at: expiresAt,
+            used: false
+          });
+        } catch (e) {
+          console.warn("[dataService] Gravação no Supabase password_resets:", e);
+        }
+      }
+
+      // Armazenar localmente para contingência em modo apresentação
+      const resets = getFromStorage<any[]>("ism_password_resets", []);
+      resets.forEach(r => { if (r.email === normalizedEmail) r.used = true; });
+      resets.push({
+        email: normalizedEmail,
+        code: otpCode,
+        code_hash: hashedCode,
+        expires_at: Date.now() + 10 * 60 * 1000,
+        used: false
+      });
+      saveToStorage("ism_password_resets", resets);
+
+      const log = createAuditLog("PASSWORD_RESET_REQUEST", normalizedEmail, undefined, "Solicitação de código OTP gerada");
+      const logs = getFromStorage<SecurityAuditRecord[]>("ism_audit_logs", []);
+      logs.unshift(log);
+      saveToStorage("ism_audit_logs", logs.slice(0, 100));
+
+      // Feedback no console do navegador para demonstração rápida caso e-mail real não esteja configurado
+      console.info(
+        `%c[INDUSTRIAL SAFETY MONITOR - DEMO OTP]%c\nE-mail: ${normalizedEmail}\nCódigo de Verificação: ${otpCode}\nValidade: 10 minutos`,
+        "background: #eab308; color: #000; font-weight: bold; padding: 2px 6px; border-radius: 4px;",
+        "color: #eab308; font-weight: bold;"
+      );
+
       return { 
         success: true, 
-        message: "Se o e-mail informado estiver cadastrado no sistema, um código de uso único (OTP) foi enviado." 
+        message: "Código de verificação enviado com sucesso para o e-mail cadastrado." 
       };
     } catch (fallbackErr) {
       console.error("[dataService] Erro ao processar solicitação de recuperação:", fallbackErr);

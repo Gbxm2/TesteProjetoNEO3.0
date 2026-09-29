@@ -9,6 +9,7 @@ export interface EmployeeTelemetry {
   aceleracaoG?: number;
   picoAceleracaoG?: number;
   picoG?: number;
+  giroscopioGraus?: number;
   pontuacao?: number;
   pontosMPU?: number;
   pontosVibracao?: number;

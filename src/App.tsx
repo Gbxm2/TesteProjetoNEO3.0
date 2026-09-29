@@ -164,47 +164,147 @@ export default function App() {
       );
     }
 
-    // Suporte a VITE_API_URL para deploy no Vercel.
-    const apiBaseUrl = import.meta.env.VITE_API_URL || "";
+    let isSubscribed = true;
+    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+
+    // Suporte a VITE_API_URL para deploy no Vercel e túnel ngrok
+    const apiBaseUrl = (import.meta.env.VITE_API_URL || "").trim().replace(/\/$/, "");
     let wsUrl: string;
     if (apiBaseUrl) {
-      wsUrl = apiBaseUrl.replace(/^http/, "ws").replace(/^https/, "wss");
+      const baseWs = apiBaseUrl.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+      wsUrl = baseWs.includes("ngrok")
+        ? `${baseWs}?ngrok-skip-browser-warning=true`
+        : baseWs;
     } else {
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const host = window.location.host;
       wsUrl = `${protocol}//${host}`;
     }
 
-    try {
-      ws.current = new WebSocket(wsUrl);
+    const connectWebSocket = () => {
+      if (!isSubscribed) return;
+      try {
+        ws.current = new WebSocket(wsUrl);
 
-      ws.current.onopen = () => {
-        if (userLocation) {
-          ws.current?.send(JSON.stringify({ type: "SET_BASE_LOCATION", lat: userLocation[0], lng: userLocation[1] }));
-        }
-      };
-
-      ws.current.onmessage = (event) => {
-        try {
-          const message: WebSocketMessage = JSON.parse(event.data);
-          if (message.type === "INITIAL_STATE" || message.type === "UPDATE") {
-            setEmployees(message.data);
-            if (message.stats) {
-              setStats(message.stats);
-            }
-            if (message.activities) {
-              setActivities(message.activities);
-            }
+        ws.current.onopen = () => {
+          if (userLocation) {
+            ws.current?.send(JSON.stringify({ type: "SET_BASE_LOCATION", lat: userLocation[0], lng: userLocation[1] }));
           }
-        } catch (err) {
-          console.error("Erro ao processar mensagem do WebSocket", err);
+        };
+
+        ws.current.onmessage = (event) => {
+          try {
+            const message: WebSocketMessage = JSON.parse(event.data);
+            if (message.type === "INITIAL_STATE" || message.type === "UPDATE") {
+              setEmployees(message.data);
+              if (message.stats) {
+                setStats(message.stats);
+              }
+              if (message.activities) {
+                setActivities(message.activities);
+              }
+            }
+          } catch (err) {
+            console.error("Erro ao processar mensagem do WebSocket", err);
+          }
+        };
+
+        ws.current.onclose = () => {
+          if (isSubscribed) {
+            reconnectTimeout = setTimeout(connectWebSocket, 3000);
+          }
+        };
+
+        ws.current.onerror = () => {
+          ws.current?.close();
+        };
+      } catch {
+        console.info("WebSocket não disponível no momento. Operando via polling HTTP contínuo.");
+      }
+    };
+
+    connectWebSocket();
+
+    // Fallback de polling HTTP para garantir telemetria contínua do ESP32 mesmo se o WebSocket oscilar no Vercel / ngrok
+    const pollingInterval = setInterval(async () => {
+      if (!isSubscribed) return;
+      try {
+        const targetUrl = apiBaseUrl || "";
+        const [dadosRes, statsRes] = await Promise.all([
+          fetch(`${targetUrl}/api/dados`, {
+            headers: { "ngrok-skip-browser-warning": "true" },
+            signal: AbortSignal.timeout(2000)
+          }).catch(() => null),
+          fetch(`${targetUrl}/api/stats`, {
+            headers: { "ngrok-skip-browser-warning": "true" },
+            signal: AbortSignal.timeout(2000)
+          }).catch(() => null)
+        ]);
+
+        if (dadosRes && dadosRes.ok) {
+          const dados = await dadosRes.json();
+          if (dados && (dados.aceleracaoG !== undefined || dados.wifi)) {
+            setEmployees(prev => prev.map(emp => {
+              if (emp.id === "EMP001") {
+                const isImpact = dados.impacto === true || dados.impacto === "true" || (Number(dados.pontuacao) >= 60);
+                const latVal = typeof dados.latitude === "number" ? dados.latitude : parseFloat(dados.latitude);
+                const lngVal = typeof dados.longitude === "number" ? dados.longitude : parseFloat(dados.longitude);
+                const hasValidGps = (dados.gpsValido === true || dados.gpsValido === "true") && !isNaN(latVal) && !isNaN(lngVal) && (latVal !== 0 || lngVal !== 0);
+
+                return {
+                  ...emp,
+                  status: isImpact ? "EMERGENCY" : (emp.status === "EMERGENCY" ? "EMERGENCY" : "ONLINE"),
+                  lat: hasValidGps ? latVal : emp.lat,
+                  lng: hasValidGps ? lngVal : emp.lng,
+                  lastSeen: Date.now(),
+                  telemetry: {
+                    ...emp.telemetry,
+                    aceleracao: Number(dados.aceleracao) || 0,
+                    aceleracaoG: Number(dados.aceleracaoG) || 0,
+                    picoAceleracaoG: Number(dados.picoAceleracaoG) || Number(dados.picoG) || 0,
+                    picoG: Number(dados.picoG) || 0,
+                    giroscopioGraus: Number(dados.giroscopioGraus) || 0,
+                    pontuacao: Number(dados.pontuacao) || 0,
+                    pontosMPU: Number(dados.pontosMPU) || 0,
+                    pontosVibracao: Number(dados.pontosVibracao) || 0,
+                    pontosSom: Number(dados.pontosSom) || 0,
+                    vibracao: dados.vibracao === true || dados.vibracao === "true",
+                    som: dados.som === true || dados.som === "true",
+                    wifi: dados.wifi || "CONECTADO",
+                    ip: dados.ip || "",
+                    satelites: Number(dados.satelites) || 0,
+                    altitude: Number(dados.altitude) || 0,
+                    hdop: Number(dados.hdop) || 0,
+                    gpsValido: dados.gpsValido === true || dados.gpsValido === "true",
+                    mapsUrl: dados.mapsUrl || ""
+                  }
+                };
+              }
+              return emp;
+            }));
+          }
         }
-      };
-    } catch (e) {
-      console.info("WebSocket local não disponível no momento. Operando com dados em cache.");
-    }
+
+        if (statsRes && statsRes.ok) {
+          const statsData = await statsRes.json();
+          if (statsData && statsData.signalsToday !== undefined) {
+            setStats(prev => ({
+              ...prev,
+              signalsToday: statsData.signalsToday,
+              emergenciesToday: statsData.emergenciesToday ?? prev.emergenciesToday,
+              systemStatus: statsData.systemStatus ?? prev.systemStatus
+            }));
+          }
+        }
+      } catch {
+        // Silencioso em caso de falha transitória de rede
+      }
+    }, 1500);
 
     return () => {
+      isSubscribed = false;
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      clearInterval(pollingInterval);
       ws.current?.close();
     };
   }, [isAuthenticated]);

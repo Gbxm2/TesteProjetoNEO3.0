@@ -35,3 +35,7 @@ Thumbs.db
 
 # MCPs com tokens reais (NUNCA subir para o GitHub!)
 .agents/mcp_config.json
+
+# Pastas de referência temporárias / migração
+JOSETeste_IAstudio2.2/
+

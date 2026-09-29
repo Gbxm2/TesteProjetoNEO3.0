@@ -13,6 +13,11 @@
 const HASH_PREFIX = "$ism_sha256$";
 const SYSTEM_SALT = "ISM_SAFETY_SALT_2026_SECURE_#";
 
+// Prefixo identificador para CPFs criptografados com AES-GCM
+const CPF_ENC_PREFIX = "$ism_cpf_enc$";
+// Chave derivada fixa para criptografia simétrica AES-GCM do CPF (determinística, sem necessidade de chave externa)
+const CPF_AES_KEY_MATERIAL = "ISM_CPF_AES256_KEY_2026_LGPD_#";
+
 /**
  * Converte um ArrayBuffer em uma string hexadecimal.
  */
@@ -87,6 +92,9 @@ export async function verifyPassword(inputPassword: string, storedPasswordOrHash
  */
 export function maskCPF(cpf?: string | null, isFullAccess: boolean = false): string {
   if (!cpf) return "Não informado";
+  if (isCPFEncrypted(cpf)) {
+    return isFullAccess ? "[CPF Protegido - AES-256]" : "***.***.***-**";
+  }
   if (isFullAccess) return cpf;
   
   const clean = cpf.replace(/\D/g, "");
@@ -148,3 +156,133 @@ export function createAuditLog(
     details
   };
 }
+
+// ============================================================
+// CRIPTOGRAFIA SIMÉTRICA AES-GCM PARA CPF (REVERSÍVEL / LGPD)
+// Diferente da senha (hash SHA-256 irreversível), o CPF precisa ser
+// recuperável para exibição a usuários MASTER autorizados.
+// ============================================================
+
+/**
+ * Deriva uma chave AES-256 a partir do material fixo usando PBKDF2.
+ */
+async function deriveAESKey(): Promise<CryptoKey> {
+  const encoder = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(CPF_AES_KEY_MATERIAL),
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  );
+  return crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt: encoder.encode(SYSTEM_SALT),
+      iterations: 100000,
+      hash: "SHA-256"
+    },
+    keyMaterial,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+/**
+ * Verifica se um valor de CPF já está criptografado pelo sistema.
+ */
+export function isCPFEncrypted(cpf?: string | null): boolean {
+  if (!cpf) return false;
+  return cpf.startsWith(CPF_ENC_PREFIX);
+}
+
+/**
+ * Criptografa um CPF em texto puro usando AES-256-GCM.
+ * Retorna string no formato: $ism_cpf_enc$<iv_hex>:<ciphertext_hex>
+ * Se o CPF já estiver criptografado, retorna sem alteração.
+ */
+export async function encryptCPF(plainCpf: string): Promise<string> {
+  if (!plainCpf || plainCpf.trim() === "") return "";
+  
+  // Se já estiver criptografado, não re-criptografar
+  if (isCPFEncrypted(plainCpf)) {
+    return plainCpf;
+  }
+
+  try {
+    const key = await deriveAESKey();
+    const encoder = new TextEncoder();
+    const iv = crypto.getRandomValues(new Uint8Array(12)); // IV de 96 bits para AES-GCM
+    
+    const encrypted = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv },
+      key,
+      encoder.encode(plainCpf)
+    );
+
+    const ivHex = Array.from(iv).map(b => b.toString(16).padStart(2, "0")).join("");
+    const cipherHex = Array.from(new Uint8Array(encrypted)).map(b => b.toString(16).padStart(2, "0")).join("");
+    
+    return `${CPF_ENC_PREFIX}${ivHex}:${cipherHex}`;
+  } catch (err) {
+    console.warn("[Security] Falha na criptografia AES-GCM do CPF, armazenando mascarado:", err);
+    // Fallback seguro: retorna CPF mascarado ao invés de texto puro
+    const clean = plainCpf.replace(/\D/g, "");
+    if (clean.length === 11) {
+      return `***.${clean.substring(3, 6)}.${clean.substring(6, 9)}-**`;
+    }
+    return "***.***.***-**";
+  }
+}
+
+/**
+ * Descriptografa um CPF criptografado com AES-256-GCM.
+ * Retorna o CPF em texto puro. Se o valor não estiver criptografado, retorna como está.
+ */
+export async function decryptCPF(encryptedCpf: string): Promise<string> {
+  if (!encryptedCpf || encryptedCpf.trim() === "") return "";
+  
+  // Se não estiver criptografado, retornar como está (compatibilidade retroativa)
+  if (!isCPFEncrypted(encryptedCpf)) {
+    return encryptedCpf;
+  }
+
+  try {
+    const payload = encryptedCpf.slice(CPF_ENC_PREFIX.length);
+    const [ivHex, cipherHex] = payload.split(":");
+    
+    if (!ivHex || !cipherHex) {
+      console.warn("[Security] Formato de CPF criptografado inválido");
+      return "***.***.***-**";
+    }
+
+    const iv = new Uint8Array(ivHex.match(/.{2}/g)!.map(b => parseInt(b, 16)));
+    const cipherBytes = new Uint8Array(cipherHex.match(/.{2}/g)!.map(b => parseInt(b, 16)));
+
+    const key = await deriveAESKey();
+    const decrypted = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv },
+      key,
+      cipherBytes
+    );
+
+    return new TextDecoder().decode(decrypted);
+  } catch (err) {
+    console.warn("[Security] Falha na descriptografia AES-GCM do CPF:", err);
+    return "***.***.***-**";
+  }
+}
+
+/**
+ * Validação rigorosa de formato de e-mail (RFC 5322 simplificada).
+ * Verifica: presença de @, domínio com ponto, TLD mínimo 2 chars, sem espaços.
+ */
+export function isValidEmailStrict(email: string): boolean {
+  if (!email || typeof email !== "string") return false;
+  const trimmed = email.trim();
+  if (trimmed.length < 5 || trimmed.length > 254) return false;
+  const regex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+  return regex.test(trimmed);
+}
+
