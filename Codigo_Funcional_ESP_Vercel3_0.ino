@@ -1,3 +1,36 @@
+/**
+ * ============================================================================
+ * INDUSTRIAL SAFETY MONITOR - FIRMWARE ESP32 DO CAPACETE INTELIGENTE (IoT EDGE)
+ * ============================================================================
+ * [GUIA PARA O SQUAD DE HARDWARE & FIRMWARE]
+ * 
+ * OBJETIVO:
+ * Este firmware é embarcado no microcontrolador ESP32 acoplado ao capacete de segurança
+ * industrial (Capacete Inteligente IoT - Nó EMP001 / Gabriel Araújo).
+ * 
+ * MAPEAMENTO DE HARDWARE & PINAGEM:
+ * - MPU6050 (Acelerômetro + Giroscópio): I2C (SDA=GPIO 21, SCL=GPIO 22)
+ * - SW-420 (Sensor de Vibração Piezoelétrico): GPIO 5 (Entrada Digital)
+ * - FC-04 (Sensor de Som / Microfone de Impacto Acústico): GPIO 23 (Entrada Digital)
+ * - GPS NEO-6M (Telemetria Geográfica): Hardware Serial 2 (RX=GPIO 16, TX=GPIO 17)
+ * 
+ * ALGORITMO DE FUSÃO SENSORIAL E PONTUAÇÃO DE IMPACTO:
+ * 1. Amostragem em alta frequência do MPU6050 (~200 leituras/seg, intervalo 5ms).
+ * 2. Cálculo do vetor de aceleração resultante em unidades de força G (gravidade).
+ * 3. Gatilho de Janela de Análise (200ms) quando aceleração ultrapassar LIMITE_INICIO_IMPACTO_G (2.0G).
+ * 4. Pontuação composta (Score 0 a 100):
+ *    - Contribuição MPU6050: Até 60 pontos baseados no pico de desaceleração.
+ *    - Contribuição Vibração (SW-420): 25 pontos se houver vibração mecânica coincidente.
+ *    - Contribuição Som (FC-04): 15 pontos se houver ruído acústico de colisão coincidente.
+ * 5. Impacto crítico confirmado se Score >= 60 ou pico isolado >= 12.0G.
+ * 
+ * CAMADA DE COMUNICAÇÃO DISTRIBUÍDA:
+ * - Transmite pacotes JSON via HTTP POST para /api/dados (IP do gateway ou túnel) a cada 1000ms.
+ * - Disponibiliza WebServer local (porta 80) com autenticação HTTP Basic e atualização OTA.
+ * - Proteção contra força bruta embutida no microcontrolador com bloqueio temporário de IP.
+ * ============================================================================
+ */
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>

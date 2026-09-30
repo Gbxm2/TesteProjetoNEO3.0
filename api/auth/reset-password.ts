@@ -1,8 +1,25 @@
-// ============================================================
-// VERCEL SERVERLESS FUNCTION: /api/auth/reset-password
-// Responsável por: Validar OTP (hash SHA-256), atualizar senha no Supabase
-// Funciona em produção no Vercel sem precisar do server.ts local
-// ============================================================
+/**
+ * ============================================================================
+ * INDUSTRIAL SAFETY MONITOR - SERVERLESS FUNCTION: /api/auth/reset-password
+ * ============================================================================
+ * [GUIA PARA O SQUAD DE CLOUD & SERVERLESS - VERCEL]
+ * 
+ * FINALIDADE:
+ * Validação segura de token OTP e redefinição de credenciais de acesso em ambiente serverless Vercel.
+ * 
+ * FLUXO DE SEGURANÇA & MITIGAÇÃO OWASP:
+ * 1. Proteção contra Ataques de Dicionário / Força Bruta:
+ *    - Limite estrito de 5 tentativas por código OTP emitido.
+ *    - Após a 5ª tentativa falha, o código é marcado como inválido/bloqueado.
+ *    - Rate Limiting por IP para impedir bombardeamento automatizado de payloads.
+ * 2. Validação Criptográfica:
+ *    - O código fornecido é transformado em SHA-256 com o Salt do sistema e comparado com o hash no Supabase.
+ * 3. Hashing da Nova Senha:
+ *    - A nova senha é convertida para hash SHA-256 salteado com prefixo "$ism_sha256$" antes do UPDATE no banco.
+ * 4. Revogação de Sessão (Token Version Invalidation):
+ *    - O campo `token_version` do usuário é incrementado (+1) para derrubar sessões prévias roubadas/antigas.
+ * ============================================================================
+ */
 import type { IncomingMessage, ServerResponse } from "http";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";

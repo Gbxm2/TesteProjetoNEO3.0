@@ -1,3 +1,28 @@
+/**
+ * ============================================================================
+ * INDUSTRIAL SAFETY MONITOR - DATA SERVICE (CORE DE DADOS HÍBRIDO)
+ * ============================================================================
+ * [GUIA PARA O SQUAD DE DESENVOLVIMENTO]
+ * 
+ * Este serviço é o ÚNICO ponto de entrada e saída de dados de toda a camada de
+ * interface (React). Nenhum componente deve importar ou invocar o supabaseClient diretamente.
+ * 
+ * PADRÃO DE PERSISTÊNCIA DUAL & RESILIÊNCIA:
+ * 1. Single Source of Truth (Cloud): Supabase PostgreSQL (PostgREST + Realtime CDC).
+ * 2. Cache de Borda Offline-First (Local): LocalStorage estruturado.
+ *    - Quando uma mutação ocorre, gravamos no LocalStorage E no Supabase de forma concorrente.
+ *    - Se o Supabase estiver offline ou sem rede, a aplicação continua operando sem travar.
+ * 3. Sincronização em Tempo Real (Realtime):
+ *    - Inscrição via WebSocket no canal 'ism_realtime_channel'.
+ *    - Heartbeat de background (a cada 5 segundos) que detecta inserts/updates remotos
+ *      e atualiza a tela do usuário de forma reativa.
+ * 4. Segurança & LGPD:
+ *    - Senhas são sempre hasheadas com SHA-256 + salt antes da persistência.
+ *    - CPFs são criptografados com AES-256-GCM em repouso.
+ *    - Auditoria de segurança é gravada a cada alteração sensível.
+ * ============================================================================
+ */
+
 import { supabase, isSupabaseConfigured } from "./supabaseClient";
 import { 
   Employee, 

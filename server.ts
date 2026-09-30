@@ -1,3 +1,28 @@
+/**
+ * ============================================================================
+ * INDUSTRIAL SAFETY MONITOR - SERVIDOR BACKEND PRINCIPAL (API & TELEMETRIA)
+ * ============================================================================
+ * [GUIA PARA O SQUAD DE DESENVOLVIMENTO]
+ * 
+ * ARQUITETURA DESTE SERVIDOR:
+ * Este arquivo atua como o Nó Concentrador Local e Gateway de Telemetria IoT do sistema:
+ * 1. Express API (Porta 3000): Endpoints REST para autenticação, configurações e ingestão de sensores.
+ * 2. WebSocket Server (ws): Transmissão com latência sub-100ms para dashboards em tempo real (COI).
+ * 3. Vite Middleware (Dev) / Static SPA (Prod): Serve o frontend React otimizado.
+ * 4. Dual-Persistence / Resiliência: Persiste tanto no banco PostgreSQL do Supabase quanto
+ *    mantém réplica operacional em memória RAM para manter o sistema ativo mesmo com a internet oscilando.
+ * 5. Cibersegurança & LGPD: Cifragem AES-256-GCM para dados sensíveis, Rate Limiting contra DoS/Brute Force,
+ *    hashing salteado para credenciais e cabeçalhos defensivos HTTP (OWASP).
+ * 
+ * FLUXO DE TELEMETRIA:
+ * ESP32 (Hardware IoT) ---> POST /api/dados (HTTP) ---> applyESP32Data()
+ *                                                            |
+ *     +------------------------------------------------------+------------------------------------------------------+
+ *     |                                                      |                                                      |
+ * WebSocket Broadcast (Clientes Locais)            Persistência Supabase (Cloud)                      Detecção de Acidente
+ * ============================================================================
+ */
+
 import express from "express";
 import { createServer } from "http";
 import { WebSocketServer, WebSocket } from "ws";
@@ -17,7 +42,8 @@ const __dirname = path.dirname(__filename);
 
 const PORT = 3000;
 
-// Inicialização do Supabase para persistência dos dados do ESP32
+// [DEV NOTE]: Conexão Híbrida com Supabase.
+// Se as variáveis estiverem ausentes, o servidor entra automaticamente em modo Standalone/Em-Memória.
 const supabaseUrl = (process.env.VITE_SUPABASE_URL || "").trim();
 const supabaseKey = (process.env.VITE_SUPABASE_ANON_KEY || "").trim();
 let supabase: SupabaseClient | null = null;

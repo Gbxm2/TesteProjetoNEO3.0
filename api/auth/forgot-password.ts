@@ -1,8 +1,23 @@
-// ============================================================
-// VERCEL SERVERLESS FUNCTION: /api/auth/forgot-password
-// Responsável por: Gerar OTP, persistir no Supabase e enviar e-mail via Resend
-// Funciona em produção no Vercel sem precisar do server.ts local
-// ============================================================
+/**
+ * ============================================================================
+ * INDUSTRIAL SAFETY MONITOR - SERVERLESS FUNCTION: /api/auth/forgot-password
+ * ============================================================================
+ * [GUIA PARA O SQUAD DE CLOUD & SERVERLESS - VERCEL]
+ * 
+ * FINALIDADE:
+ * Processa solicitações de recuperação de senha em ambiente de produção Vercel.
+ * Opera de forma 100% serverless, sem depender de instância fixa do server.ts.
+ * 
+ * FLUXO DE SEGURANÇA & OWASP:
+ * 1. Rate Limiting por IP: Máximo de 3 solicitações a cada 15 minutos (prevenção de DoS/Spam de e-mail).
+ * 2. Validação Estrita: Rejeita entradas mal formatadas ou e-mails inválidos.
+ * 3. Invalidação Atômica: Invalida qualquer OTP emitido anteriormente para o mesmo usuário.
+ * 4. Hashing do Token OTP: O código de 6 dígitos NUNCA é salvo em texto claro no Supabase;
+ *    apenas seu hash SHA-256 + Salt do sistema é persistido.
+ * 5. Expiração Curta: Janela estrita de 10 minutos para utilização.
+ * 6. Disparo Transacional: Envia e-mail formatado via Resend API (ou simulação dev se chave não configurada).
+ * ============================================================================
+ */
 import type { IncomingMessage, ServerResponse } from "http";
 import { createClient } from "@supabase/supabase-js";
 import { Resend } from "resend";
@@ -15,7 +30,7 @@ type VercelResponse = ServerResponse & {
   end: () => void;
 };
 
-// Inicializa Supabase (usa as variáveis de ambiente do Vercel)
+// Inicializa Supabase (usa as variáveis de ambiente configuradas no Vercel Dashboard)
 const supabaseUrl = (process.env.VITE_SUPABASE_URL || "").trim();
 const supabaseKey = (process.env.VITE_SUPABASE_ANON_KEY || "").trim();
 const supabase =

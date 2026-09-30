@@ -1,21 +1,31 @@
 /**
+ * ============================================================================
  * INDUSTRIAL SAFETY MONITOR - MÓDULO DE CIBERSEGURANÇA E PRIVACIDADE (LGPD)
+ * ============================================================================
+ * [GUIA PARA O SQUAD DE DEVS]
+ * Este módulo centraliza todas as primitivas de segurança e criptografia da aplicação.
+ * Qualquer manipulação de dados pessoais (CPF, e-mail) ou credenciais (senhas, OTP)
+ * DEVE obrigatoriamente utilizar as funções exportadas por este arquivo.
  * 
- * Implementa boas práticas OWASP Top 10 e LGPD (Lei nº 13.709/2018):
- * 1. Hashing criptográfico de senhas (Web Crypto API - SHA-256 + Salt)
- * 2. Suporte à migração segura transparente de senhas legadas
- * 3. Mascaramento e proteção de dados pessoais sensíveis (CPF, contatos)
- * 4. Sanitização de inputs para prevenção de XSS e injeções
- * 5. Registro e formato padronizado de logs de auditoria de segurança
+ * PADRÕES E DIRETRIZES APLICADAS:
+ * 1. OWASP Top 10 (A02:2021 Cryptographic Failures & A03:2021 Injection)
+ * 2. LGPD (Lei nº 13.709/2018 - Princípios da Minimização, Finalidade e Segurança)
+ * 3. Hashing de senhas: SHA-256 + Salt duplo de 32 bytes com prefixo "$ism_sha256$"
+ * 4. Criptografia em repouso: AES-256-GCM com chave derivada via PBKDF2 (100.000 iterações)
+ * 5. Sanitização de inputs contra XSS reflexivo e persistente
+ * 6. Auditoria estruturada de ações operacionais e administrativas
+ * ============================================================================
  */
 
 // Prefixo identificador para diferenciar senhas já hasheadas de senhas em texto puro
+// [DEV NOTE]: Sempre verificar este prefixo antes de hashear para evitar hashes aninhados
 const HASH_PREFIX = "$ism_sha256$";
 const SYSTEM_SALT = "ISM_SAFETY_SALT_2026_SECURE_#";
 
 // Prefixo identificador para CPFs criptografados com AES-GCM
+// [DEV NOTE]: O formato final armazenado é: $ism_cpf_enc$<iv_hex>:<ciphertext_hex><authTag_hex>
 const CPF_ENC_PREFIX = "$ism_cpf_enc$";
-// Chave derivada fixa para criptografia simétrica AES-GCM do CPF (determinística, sem necessidade de chave externa)
+// Chave derivada fixa para criptografia simétrica AES-GCM do CPF (determinística, compatível browser/Node)
 const CPF_AES_KEY_MATERIAL = "ISM_CPF_AES256_KEY_2026_LGPD_#";
 
 /**
@@ -159,12 +169,15 @@ export function createAuditLog(
 
 // ============================================================
 // CRIPTOGRAFIA SIMÉTRICA AES-GCM PARA CPF (REVERSÍVEL / LGPD)
-// Diferente da senha (hash SHA-256 irreversível), o CPF precisa ser
-// recuperável para exibição a usuários MASTER autorizados.
+// [DIRETRIZ OWASP / LGPD]: Diferente da senha (hash SHA-256 irreversível),
+// o CPF precisa ser recuperável exclusivamente para exibição a usuários
+// de perfil MASTER devidamente autenticados, ou para integração governamental.
+// Nunca persista CPF em texto claro no banco ou localStorage.
 // ============================================================
 
 /**
  * Deriva uma chave AES-256 a partir do material fixo usando PBKDF2.
+ * Utiliza 100.000 iterações com SHA-256 para resistência a ataques de força bruta.
  */
 async function deriveAESKey(): Promise<CryptoKey> {
   const encoder = new TextEncoder();
@@ -191,6 +204,7 @@ async function deriveAESKey(): Promise<CryptoKey> {
 
 /**
  * Verifica se um valor de CPF já está criptografado pelo sistema.
+ * [DEV NOTE]: Use esta checagem antes de submeter formulários para evitar dupla cifragem.
  */
 export function isCPFEncrypted(cpf?: string | null): boolean {
   if (!cpf) return false;
@@ -199,6 +213,8 @@ export function isCPFEncrypted(cpf?: string | null): boolean {
 
 /**
  * Criptografa um CPF em texto puro usando AES-256-GCM.
+ * Gera um IV aleatório de 96 bits a cada execução, garantindo que o mesmo CPF
+ * gere saídas criptográficas distintas (indistinguibilidade semântica).
  * Retorna string no formato: $ism_cpf_enc$<iv_hex>:<ciphertext_hex>
  * Se o CPF já estiver criptografado, retorna sem alteração.
  */
